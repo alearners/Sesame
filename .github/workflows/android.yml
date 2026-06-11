@@ -1,26 +1,331 @@
-name: Android CI
+name: Release Build
+run-name: Release Build - ${{ github.ref_name }}
 
 on:
   push:
-分支: [ "main" ]
-  pull_request:
-分支: [ "main" ]
+    tags:
+      - "[0-9]*-*"
+
+env:
+  CI: "true"
+  JAVA_DISTRIBUTION: "oracle"
+  JAVA_VERSION: "17.0.1"
+  ANDROID_API_LEVEL: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  LOCAL_GRADLE_VERSION: "9.4.0-milestone-3"
+  LOCAL_AGP_VERSION: "9.0.1"
+  LOCAL_KOTLIN_VERSION: "2.2.10"
+  RELEASE_DIR: app/build/outputs/apk/release
+  STAGING_DIR: app/build/outputs/apk/all
+  ASSET_DIR: app/build/outputs/apk/release-assets
+  RELEASE_TAG_RAW: ${{ github.ref_name }}
+  TARGET_SOURCE_BRANCH: dev
+  PUBLISH_TO_XPOSED_REPO: "false"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-
+  preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      reason: ${{ steps.check.outputs.reason }}
+      tag_valid: ${{ steps.meta.outputs.tag_valid }}
+      tag_version_code: ${{ steps.meta.outputs.tag_version_code }}
+      configured_version_name: ${{ steps.meta.outputs.configured_version_name }}
+      version_name: ${{ steps.meta.outputs.version_name }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+      xposed_tag: ${{ steps.meta.outputs.xposed_tag }}
 
     steps:
-    - uses: actions/checkout@v4
-    - name: set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        java-version: '11'
-        distribution: 'temurin'
-        cache: gradle
+      - name: Set Timezone to Asia/Shanghai
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "Current time: $(date)"
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    - name: Build with Gradle
-      run: ./gradlew build
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          submodules: false
+
+      - name: Validate Project Toolchain Baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
+          grep -Eq '^android-plugin = "'"${LOCAL_AGP_VERSION//./\\.}"'"$' gradle/libs.versions.toml
+          grep -Eq '^kotlin = "'"${LOCAL_KOTLIN_VERSION//./\\.}"'"$' gradle/libs.versions.toml
+          grep -Eq '^appVersion=.+' gradle.properties
+          grep -Eq 'compileSdk = '"${ANDROID_API_LEVEL}"'$' app/build.gradle.kts
+          grep -Eq 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
+          grep -Eq 'targetCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
+
+      - name: Resolve Release Metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag_regex='^([0-9]+)-(.+)$'
+          tag_valid="false"
+          tag_version_code=""
+          configured_version_name=""
+          version_name=""
+          if [[ "${RELEASE_TAG_RAW}" =~ ${release_tag_regex} ]]; then
+            tag_valid="true"
+            tag_version_code="${BASH_REMATCH[1]}"
+            version_name="${BASH_REMATCH[2]}"
+          fi
+          configured_version_name="$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')"
+          if [[ -z "${configured_version_name}" ]]; then
+            echo "Failed to resolve appVersion from gradle.properties" >&2
+            exit 1
+          fi
+          version_code="$(git rev-list --count HEAD | tr -d '\n')"
+          if [[ -z "${version_code}" ]]; then
+            echo "Failed to resolve versionCode from git history" >&2
+            exit 1
+          fi
+          xposed_tag="${RELEASE_TAG_RAW}"
+          echo "tag_valid=${tag_valid}" >> "$GITHUB_OUTPUT"
+          echo "tag_version_code=${tag_version_code}" >> "$GITHUB_OUTPUT"
+          echo "configured_version_name=${configured_version_name}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
+          echo "xposed_tag=${xposed_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check Env & Tag Format
+        id: check
+        shell: bash
+        env:
+          TAG_VALID: ${{ steps.meta.outputs.tag_valid }}
+          TAG_VERSION_CODE: ${{ steps.meta.outputs.tag_version_code }}
+          CONFIGURED_VERSION_NAME: ${{ steps.meta.outputs.configured_version_name }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          ready="false"
+          reason=""
+          if [[ "${TAG_VALID}" != "true" ]]; then
+            reason="标签 ${RELEASE_TAG_RAW} 不符合 VersionCode-VersionName 格式"
+          elif [[ "${VERSION_NAME}" != "${CONFIGURED_VERSION_NAME}" ]]; then
+            reason="标签版本名与 gradle.properties appVersion 不一致"
+          elif [[ "${TAG_VERSION_CODE}" != "${VERSION_CODE}" ]]; then
+            reason="标签 versionCode 与当前提交计算 versionCode 不一致"
+          elif ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${TARGET_SOURCE_BRANCH}"; then
+            reason="标签提交不在 dev 分支上"
+          else
+            ready="true"
+            reason="预检通过，构建未签名APK"
+          fi
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          {
+            echo "reason<<EOF"
+            printf '%s\n' "${reason}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release Preflight"
+            echo "- 触发事件: \`push(tag)\`"
+            echo "- 源仓库标签: \`${RELEASE_TAG_RAW}\`"
+            echo "- 校验分支: \`${TARGET_SOURCE_BRANCH}\`"
+            echo "- 标签格式有效: \`${TAG_VALID}\`"
+            echo "- 标签 versionCode: \`${TAG_VERSION_CODE}\`"
+            echo "- 配置 appVersion: \`${CONFIGURED_VERSION_NAME}\`"
+            echo "- 构建 versionCode: \`${VERSION_CODE}\`"
+            echo "- 检查结果: ${reason}"
+            echo "- 模式：个人自用，不签名、不跨仓库同步"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set Timezone to Asia/Shanghai
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "Current time: $(date)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          submodules: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          check-latest: false
+          cache: gradle
+
+      - name: Pin Gradle Java Home
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Required Android SDK Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "platforms;android-${ANDROID_API_LEVEL}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-version: wrapper
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Print Toolchain Versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JAVA_HOME=${JAVA_HOME}"
+          java -version
+          sdkmanager --version
+          ./gradlew --version
+
+      - name: Build Unsigned Release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Stage Unsigned APK Assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${STAGING_DIR}" "${ASSET_DIR}"
+          mkdir -p "${STAGING_DIR}" "${ASSET_DIR}"
+          mapfile -t apks < <(find "${RELEASE_DIR}" -maxdepth 1 -type f -name "*.apk" | sort)
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "No release APKs found in ${RELEASE_DIR}" >&2
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            cp "${apk}" "${STAGING_DIR}/"
+            cp "${apk}" "${ASSET_DIR}/"
+          done
+          ls -la "${ASSET_DIR}"
+
+      - name: Generate Release Notes
+        id: release_notes
+        shell: bash
+        env:
+          GITHUB_API_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          XPOSED_TAG: ${{ needs.preflight.outputs.xposed_tag }}
+        run: |
+          set -euo pipefail
+          body_path="${RUNNER_TEMP}/release-body.md"
+          tag_object_type="$(git cat-file -t "${GITHUB_REF}" 2>/dev/null || true)"
+          repo_name="${REPOSITORY#*/}"
+          tag_notes=""
+          prev_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          commit_history_url="https://github.com/${REPOSITORY}/commits/${RELEASE_TAG_RAW}"
+          compare_url=""
+          commit_range_display="首次发布（完整历史）"
+          range_args=("${GITHUB_SHA}")
+          excluded_type_regex='^(docs|style|ci|test|build)(\([^)]*\))?[!]?:[[:space:]]+'
+          commit_type_regex='^([[:alpha:]]+)(\([^)]*\))?[!]?:[[:space:]]+'
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+          categories=(feat fix perf refactor revert other)
+          declare -A category_titles=(["feat"]="新功能" ["fix"]="问题修复" ["perf"]="性能优化" ["refactor"]="重构调整" ["revert"]="回滚变更" ["other"]="其他更新")
+          for category in "${categories[@]}"; do : > "${tmp_dir}/${category}.md"; done
+          if [[ "${tag_object_type}" == "tag" ]]; then tag_notes="$(git for-each-ref "${GITHUB_REF}" --format='%(contents)'); fi
+          if [[ -n "${prev_tag}" ]]; then
+            compare_url="https://github.com/${REPOSITORY}/compare/${prev_tag}...${RELEASE_TAG_RAW}"
+            commit_range_display="${prev_tag}...${RELEASE_TAG_RAW}"
+            range_args=("${prev_tag}..${GITHUB_SHA}")
+          fi
+          relevant_commit_count=0
+          while IFS=$'\t' read -r commit_sha commit_subject; do
+            [[ -n "${commit_sha}" ]] || continue
+            if [[ "${commit_subject}" =~ ${excluded_type_regex} ]]; then continue; fi
+            category="other"
+            if [[ "${commit_subject}" =~ ${commit_type_regex} ]]; then
+              commit_type="${BASH_REMATCH[1],,}"
+              case "${commit_type}" in feat|fix|perf|refactor|revert) category="${commit_type}" ;; docs|style|ci|test|build) continue ;; esac
+            fi
+            relevant_commit_count=$((relevant_commit_count + 1))
+            short_sha="${commit_sha:0:7}"
+            printf -- "- %s ([%s](https://github.com/%s/commit/%s))\n" "${commit_subject}" "${short_sha}" "${REPOSITORY}" "${commit_sha}" >> "${tmp_dir}/${category}.md"
+          done < <(git log --reverse --format='%H%x09%s' "${range_args[@]}")
+          {
+            echo "### 构建说明"
+            echo "本次为**未签名APK**，仅个人测试使用，不可直接上架"
+            echo "源仓库标签：\`${RELEASE_TAG_RAW}\`"
+            echo "变更范围：\`${commit_range_display}\`"
+            if [[ -n "${tag_notes//[[:space:]]/}" ]]; then echo "## 发布备注"; echo "${tag_notes}"; fi
+            if [[ ${relevant_commit_count} -gt 0 ]]; then
+              echo "## 变更说明"
+              for category in "${categories[@]}"; do
+                if [[ -s "${tmp_dir}/${category}.md" ]]; then echo "### ${category_titles[$category]}"; cat "${tmp_dir}/${category}.md"; fi
+              done
+            fi
+            echo "## 完整提交记录"
+            if [[ -n "${compare_url}" ]]; then echo "- 版本对比：${compare_url}"; fi
+            echo "- 提交历史：${commit_history_url}"
+            echo "> 下载：附件为未签名原始 .apk 文件"
+          } > "${body_path}"
+          echo "body_path=${body_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Unsigned APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.preflight.outputs.version_name }}
+          files: ${{ env.ASSET_DIR }}/*.apk
+          token: ${{ github.token }}
+          tag_name: ${{ needs.preflight.outputs.xposed_tag }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body_path: ${{ steps.release_notes.outputs.body_path }}
+
+  skip:
+    needs: preflight
+    if: needs.preflight.outputs.ready != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Report Skip Reason
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Release workflow skipped: ${{ needs.preflight.outputs.reason }}"
+          {
+            echo "## Release Skipped"
+            echo "- 原因: ${{ needs.preflight.outputs.reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
