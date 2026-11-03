@@ -20,7 +20,7 @@ env:
   RELEASE_DIR: app/build/outputs/apk/release
   STAGING_DIR: app/build/outputs/apk/all
   ASSET_DIR: app/build/outputs/apk/release-assets
-  TARGET_SOURCE_BRANCH: dev
+  TARGET_SOURCE_BRANCH: main
 
   # 消除剩余Node版本弃用警告
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
@@ -39,7 +39,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_PAT }}
-          ref: dev
+          ref: main
 
       - name: 配置Git用户信息
         run: |
@@ -53,19 +53,19 @@ jobs:
           git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git
 
       - name: 拉取原仓库最新代码
-        run: git fetch upstream dev
+        run: git fetch upstream main
 
       # 合并代码并生成完整更新日志
       - name: 合并代码并生成完整更新日志
         id: check_update
         run: |
           BEFORE_SHA=$(git rev-parse HEAD)
-          git merge upstream/dev --no-edit -X theirs
+          git merge upstream/main --no-edit -X theirs
           AFTER_SHA=$(git rev-parse HEAD)
 
           if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
             # 修改提交信息，加上 [skip ci]，避免触发二次构建
-            git commit --amend -m "Merge upstream/dev [skip ci]"
+            git commit --amend -m "Merge upstream/main [skip ci]"
             AFTER_SHA=$(git rev-parse HEAD)
             
             echo "has_update=true" >> "$GITHUB_OUTPUT"
@@ -92,7 +92,7 @@ jobs:
 
       - name: 推送更新到本地仓库
         if: steps.check_update.outputs.has_update == 'true'
-        run: git push origin dev
+        run: git push origin main
 
       # 自定义改动统一在 customizations/apply.sh 中维护
 
@@ -125,7 +125,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: dev
+          ref: main
 
       - name: 随机等待（构建时间散开在上午8-10点窗口内）
         if: github.event_name == 'schedule'
@@ -226,10 +226,16 @@ jobs:
           git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git
           git fetch upstream --quiet
           
-          # dev 分支
-          DEV_SHA=$(git rev-parse --short upstream/dev)
-          DEV_MSG=$(git log --oneline -1 upstream/dev | cut -d' ' -f2-)
-          DEV_TIME=$(git log -1 --format="%ci" upstream/dev)
+          # dev 分支（可能不存在，容错处理）
+          if git rev-parse --short upstream/dev >/dev/null 2>&1; then
+            DEV_SHA=$(git rev-parse --short upstream/dev)
+            DEV_MSG=$(git log --oneline -1 upstream/dev | cut -d' ' -f2-)
+            DEV_TIME=$(git log -1 --format="%ci" upstream/dev)
+          else
+            DEV_SHA="N/A"
+            DEV_MSG="dev 分支不存在"
+            DEV_TIME="N/A"
+          fi
           echo "dev_latest_commit=${DEV_SHA}" >> $GITHUB_OUTPUT
           echo "dev_latest_commit_msg=${DEV_MSG}" >> $GITHUB_OUTPUT
           echo "dev_latest_commit_time=${DEV_TIME}" >> $GITHUB_OUTPUT
