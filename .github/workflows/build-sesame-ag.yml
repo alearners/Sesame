@@ -150,8 +150,7 @@ jobs:
         needs.sync-dev.outputs.dev_updated == 'true'
       )
     outputs:
-      version: ${{ steps.get_version.outputs.versionName }}
-      versionCode: ${{ steps.get_version.outputs.versionCode }}
+      version: ${{ steps.get_version.outputs.display_version }}
       tag_name: ${{ steps.get_version.outputs.tag_name }}
       dev_commit: ${{ steps.upstream_info.outputs.dev_commit }}
       main_commit: ${{ steps.upstream_info.outputs.main_commit }}
@@ -215,23 +214,53 @@ jobs:
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
-      - name: 读取动态版本号（源码正则提取）
+      - name: 读取动态版本号（严格模式）
         id: get_version
         run: |
-          # 从 app/build.gradle.kts 中提取 versionName 和 versionCode
-          VERSION_NAME=$(grep -m1 -E 'versionName\s*=' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']?([^"'\'' ]+).*/\1/' | tr -d '\r')
-          VERSION_CODE=$(grep -m1 -E 'versionCode\s*=' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
+          VERSION_NAME=""
+          VERSION_CODE=""
+
+          # 1. 尝试从 gradle.properties 读取
+          VERSION_NAME=$(grep '^appVersion=' gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
           
-          if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
-            echo "❌ 无法从 app/build.gradle.kts 中解析出版本号，请检查源码格式"
+          # 2. 尝试从 build.gradle.kts 严格匹配纯字符串（如 versionName = "0.2.6"）
+          # 如果遇到 project.property(...) 这种代码，正则将匹配失败，跳过本次赋值
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME=$(grep -m1 -E 'versionName\s*=\s*["'\''][0-9a-zA-Z\._-]+["'\'']' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']([^"'\'']+)["'\''].*/\1/' | tr -d '\r')
+          fi
+
+          # 3. 尝试从 Git 历史 Tag 解析 (匹配类似 4380-0.2.6 格式)
+          if [ -z "$VERSION_NAME" ]; then
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            if [[ "$LATEST_TAG" =~ ^[0-9]+-(.+)$ ]]; then
+              VERSION_NAME="${BASH_REMATCH[1]}"
+            fi
+          fi
+
+          # 提取 VersionCode
+          VERSION_CODE=$(grep -m1 -E 'versionCode\s*=\s*([0-9]+)' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
+          if [ -z "$VERSION_CODE" ]; then
+            VERSION_CODE=$(git rev-list --count HEAD)
+          fi
+
+          # 4. 严格校验：如果提取不到版本名，或者提取到的版本名不是纯粹的字母/数字/点/连字符（说明抓到了代码文本），直接报错退出
+          if [ -z "$VERSION_NAME" ] || [[ ! "$VERSION_NAME" =~ ^[0-9a-zA-Z\._-]+$ ]]; then
+            echo "❌ 无法从源码或 Git 历史中解析出合法的 VersionName (当前提取到: '${VERSION_NAME}')，终止流程。"
+            exit 1
+          fi
+
+          if [ -z "$VERSION_CODE" ] || [[ ! "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "❌ 无法解析出合法的 VersionCode (当前提取到: '${VERSION_CODE}')，终止流程。"
             exit 1
           fi
           
+          # 5. 组合格式化：Tag 必须安全，Display 采用你要求的格式
           TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
-          echo "versionName=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
-          echo "versionCode=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          DISPLAY_VERSION="V${VERSION_NAME}(${VERSION_CODE})"
+          
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "✅ 解析成功 -> 版本: ${VERSION_NAME} (Code: ${VERSION_CODE})"
+          echo "display_version=${DISPLAY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "✅ 解析成功 -> 展示版本: ${DISPLAY_VERSION}，底层Tag: ${TAG_NAME}"
 
       - name: 执行 Release 构建
         run: ./gradlew --no-daemon --stacktrace assembleRelease
@@ -290,7 +319,7 @@ jobs:
         run: |
           {
             echo "## 📦 构建信息"
-            echo "- 版本号：v${{ steps.get_version.outputs.versionName }}"
+            echo "- 版本号：${{ steps.get_version.outputs.display_version }}"
             echo "- Tag：${{ steps.get_version.outputs.tag_name }}"
             echo "- 构建时间：$(date '+%Y-%m-%d %H:%M:%S')"
             echo "- Action运行链接：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -316,7 +345,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.tag_name }}
-          name: Sesame-AG v${{ steps.get_version.outputs.versionName }}
+          name: Sesame-AG ${{ steps.get_version.outputs.display_version }}
           make_latest: true
           generate_release_notes: false
           body_path: release-body.md
@@ -336,10 +365,10 @@ jobs:
             curl -sS -f -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${release_id}" || true
             curl -sS -f -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/git/refs/tags/${tag_name}" || true
           done
-      - name: 构建汇总输出（在摘要里展示版本，替代job名称动态显示）
+      - name: 构建汇总输出
         run: |
-          echo "# ✅ 构建完成 | Release Build - ${{ steps.get_version.outputs.versionCode }}-${{ steps.get_version.outputs.versionName }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 版本：${{ steps.get_version.outputs.versionName }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "# ✅ 构建完成 | Release Build - ${{ steps.get_version.outputs.display_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：${{ steps.get_version.outputs.display_version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Tag：${{ steps.get_version.outputs.tag_name }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 上游dev：${{ steps.upstream_info.outputs.dev_commit }}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -361,13 +390,13 @@ jobs:
               echo "🔗 日志地址：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             } > email-body.txt
           elif [ "${{ needs.build-and-release.result }}" == "success" ]; then
-            SUBJECT="✅ Sesame-AG 构建成功 (v${{ needs.build-and-release.outputs.version }})"
+            SUBJECT="✅ Sesame-AG 构建成功 (${{ needs.build-and-release.outputs.version }})"
             {
               echo "🎉 Sesame-AG 新版本已成功构建并发布！"
               echo ""
               echo "🔗 下载地址：${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build-and-release.outputs.tag_name }}"
               echo ""
-              echo "📦 版本信息：${{ needs.build-and-release.outputs.versionCode }}-${{ needs.build-and-release.outputs.version }}"
+              echo "📦 版本信息：${{ needs.build-and-release.outputs.version }}"
               echo ""
               echo "📝 原仓库最新提交"
               echo "- dev: ${{ needs.build-and-release.outputs.dev_commit }}"
