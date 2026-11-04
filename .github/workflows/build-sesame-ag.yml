@@ -196,6 +196,10 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           set -o pipefail
           echo "::endgroup::"
+      - name: 把build-tools加入PATH（修复apksigner找不到）
+        run: |
+          echo "ANDROID_BUILD_TOOLS_PATH=$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_PATH"
       - name: 配置 Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
         with:
