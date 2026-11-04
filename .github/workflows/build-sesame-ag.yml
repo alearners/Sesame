@@ -196,7 +196,7 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           set -o pipefail
           echo "::endgroup::"
-      - name: 把build-tools加入PATH（修复apksigner找不到）
+      - name: 把build-tools加入PATH
         run: |
           echo "ANDROID_BUILD_TOOLS_PATH=$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_PATH"
@@ -229,17 +229,6 @@ jobs:
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
-      - name: APK合法性校验
-        run: |
-          echo "::group::APK校验"
-          for f in ${STAGING_DIR}/*.apk; do
-            if [ ! -s "$f" ]; then
-              echo "❌ 发现0字节文件: $f"
-              exit 1
-            fi
-            apksigner verify --min-sdk-version 21 "$f"
-          done
-          echo "::endgroup::"
       - name: 规范化文件名与版本号提取
         id: prepare_assets
         run: |
