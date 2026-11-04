@@ -1,6 +1,5 @@
 name: Sesame-AG 第三方构建
-# ========== 重点修复：run-name 动态运行标题（左侧列表显示 Release Build - 版本号） ==========
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Release Build - 手动触发' || github.event_name == 'schedule' && 'Release Build - 定时同步构建' || 'Release Build' }}
+run-name: Sesame-AG Build
 on:
   push:
     branches:
@@ -40,8 +39,6 @@ jobs:
     outputs:
       dev_updated: ${{ steps.sync.outputs.dev_updated }}
       change_log: ${{ steps.sync.outputs.change_log }}
-      upstream_versionCode: ${{ steps.fetch_upstream_version.outputs.versionCode }}
-      upstream_versionName: ${{ steps.fetch_upstream_version.outputs.versionName }}
     steps:
       - name: 检出仓库
         uses: actions/checkout@v5
@@ -57,32 +54,6 @@ jobs:
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
           git fetch upstream "${{ env.UPSTREAM_BRANCH }}" --quiet
-      # =====【核心：提前拉取上游原版版本号，取不到直接终止整个流程】=====
-      - name: 读取上游原版 versionCode / versionName
-        id: fetch_upstream_version
-        run: |
-          TMPDIR_UPSTREAM=$(mktemp -d)
-          git clone --depth=1 --branch "${{ env.UPSTREAM_BRANCH }}" "https://github.com/${{ env.UPSTREAM_REPO }}.git" "${TMPDIR_UPSTREAM}"
-          GRADLE_FILE=""
-          if [ -f "${TMPDIR_UPSTREAM}/app/build.gradle.kts" ]; then
-            GRADLE_FILE="${TMPDIR_UPSTREAM}/app/build.gradle.kts"
-          elif [ -f "${TMPDIR_UPSTREAM}/app/build.gradle" ]; then
-            GRADLE_FILE="${TMPDIR_UPSTREAM}/app/build.gradle"
-          else
-            echo "❌ 上游仓库未找到 app/build.gradle / build.gradle.kts"
-            exit 1
-          fi
-          VERSION_NAME=$(grep -E "versionName\s*=?" "${GRADLE_FILE}" | head -n1 | sed -E 's/.*versionName\s*=?\s*["'\'']([0-9.]+)["'\''].*/\1/')
-          VERSION_CODE=$(grep -E "versionCode\s*=" "${GRADLE_FILE}" | head -n1 | sed -E 's/.*versionCode\s*=?\s*([0-9]+).*/\1/')
-          if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
-            echo "❌ 上游源码读取 versionName / versionCode 失败，停止构建"
-            echo "versionName: ${VERSION_NAME}"
-            echo "versionCode: ${VERSION_CODE}"
-            exit 1
-          fi
-          echo "versionName=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
-          echo "versionCode=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
-          echo "✅ 上游原版版本: ${VERSION_CODE}-${VERSION_NAME}"
       - name: 合并上游 dev 分支
         id: sync
         run: |
@@ -100,7 +71,7 @@ jobs:
           BEFORE_SHA="$(git rev-parse HEAD)"
           git merge "upstream/${{ env.UPSTREAM_BRANCH }}" --no-commit --no-ff -X theirs || true
           if git diff --name-only --diff-filter=U | grep -q .; then
-            echo "❌ 合并上游产生冲突，属于预期业务异常，标记警告不阻断告警"
+            echo "❌ 合并上游产生冲突"
             echo "dev_updated=false" >> "$GITHUB_OUTPUT"
             echo "change_log=合并冲突" >> "$GITHUB_OUTPUT"
             exit 0
@@ -162,8 +133,7 @@ jobs:
           git push origin main --force-with-lease
           echo "✅ main 分支已同步并推送"
   build-and-release:
-    # 【Job名称使用上游读取到的版本号，和原图样式完全对齐：Release Build - 4380-0.2.6】
-    name: "📦 Release Build - ${{ needs.sync-dev.outputs.upstream_versionCode }}-${{ needs.sync-dev.outputs.upstream_versionName }}"
+    name: "📦 Release Build"
     runs-on: ubuntu-latest
     timeout-minutes: 40
     needs: sync-dev
@@ -176,8 +146,9 @@ jobs:
         needs.sync-dev.outputs.dev_updated == 'true'
       )
     outputs:
-      version: ${{ needs.sync-dev.outputs.upstream_versionName }}
-      tag_name: v${{ needs.sync-dev.outputs.upstream_versionCode }}-${{ needs.sync-dev.outputs.upstream_versionName }}
+      version: ${{ steps.get_version.outputs.versionName }}
+      versionCode: ${{ steps.get_version.outputs.versionCode }}
+      tag_name: ${{ steps.get_version.outputs.tag_name }}
       dev_commit: ${{ steps.upstream_info.outputs.dev_commit }}
       main_commit: ${{ steps.upstream_info.outputs.main_commit }}
     steps:
@@ -239,6 +210,24 @@ jobs:
           cache-cleanup: on-success
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
+
+      # =========【重点：调用gradle task动态导出版本，适配gitCommitCount()函数版本】=========
+      - name: 读取Gradle动态版本号
+        id: get_version
+        run: |
+          ./gradlew :app:printVersion -q > version_out.txt
+          cat version_out.txt
+          VERSION_NAME=$(cat version_out.txt | grep "versionName=" | cut -d'=' -f2 | xargs)
+          VERSION_CODE=$(cat version_out.txt | grep "versionCode=" | cut -d'=' -f2 | xargs)
+          if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
+            echo "❌ 无法从Gradle获取versionName / versionCode，停止构建"
+            exit 1
+          fi
+          TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
+          echo "versionName=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "versionCode=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "✅ 上游版本：${VERSION_CODE}-${VERSION_NAME}"
       - name: 执行 Release 构建
         run: ./gradlew --no-daemon --stacktrace assembleRelease
       - name: 准备待签名的 APK
@@ -296,8 +285,8 @@ jobs:
         run: |
           {
             echo "## 📦 构建信息"
-            echo "- 版本号：v${{ needs.sync-dev.outputs.upstream_versionName }}"
-            echo "- Tag：${{ needs.build-and-release.outputs.tag_name }}"
+            echo "- 版本号：v${{ steps.get_version.outputs.versionName }}"
+            echo "- Tag：${{ steps.get_version.outputs.tag_name }}"
             echo "- 构建时间：$(date '+%Y-%m-%d %H:%M:%S')"
             echo "- Action运行链接：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo ""
@@ -321,8 +310,8 @@ jobs:
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build-and-release.outputs.tag_name }}
-          name: Sesame-AG v${{ needs.sync-dev.outputs.upstream_versionName }}
+          tag_name: ${{ steps.get_version.outputs.tag_name }}
+          name: Sesame-AG v${{ steps.get_version.outputs.versionName }}
           make_latest: true
           generate_release_notes: false
           body_path: release-body.md
@@ -343,11 +332,11 @@ jobs:
             curl -sS -f -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${release_id}" || true
             curl -sS -f -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/git/refs/tags/${tag_name}" || true
           done
-      - name: 构建汇总输出
+      - name: 构建汇总输出（在摘要里展示版本，替代job名称动态显示）
         run: |
-          echo "# ✅ 构建完成" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 版本：${{ needs.sync-dev.outputs.upstream_versionName }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tag：${{ needs.build-and-release.outputs.tag_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "# ✅ 构建完成 | Release Build - ${{ steps.get_version.outputs.versionCode }}-${{ steps.get_version.outputs.versionName }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：${{ steps.get_version.outputs.versionName }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag：${{ steps.get_version.outputs.tag_name }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 上游dev：${{ steps.upstream_info.outputs.dev_commit }}" >> "$GITHUB_STEP_SUMMARY"
 
   notify-email:
@@ -368,13 +357,13 @@ jobs:
               echo "🔗 日志地址：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             } > email-body.txt
           elif [ "${{ needs.build-and-release.result }}" == "success" ]; then
-            SUBJECT="✅ Sesame-AG 构建成功 (v${{ needs.sync-dev.outputs.upstream_versionName }})"
+            SUBJECT="✅ Sesame-AG 构建成功 (v${{ needs.build-and-release.outputs.version }})"
             {
               echo "🎉 Sesame-AG 新版本已成功构建并发布！"
               echo ""
               echo "🔗 下载地址：${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build-and-release.outputs.tag_name }}"
               echo ""
-              echo "📦 版本信息：v${{ needs.sync-dev.outputs.upstream_versionName }}"
+              echo "📦 版本信息：${{ needs.build-and-release.outputs.versionCode }}-${{ needs.build-and-release.outputs.version }}"
               echo ""
               echo "📝 原仓库最新提交"
               echo "- dev: ${{ needs.build-and-release.outputs.dev_commit }}"
