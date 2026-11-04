@@ -9,6 +9,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 */3 * *'
+
 env:
   CI: "true"
   JAVA_DISTRIBUTION: "temurin"
@@ -24,6 +25,7 @@ env:
   UPSTREAM_BRANCH: "dev"
   UPSTREAM_MAIN_BRANCH: "main"
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
 concurrency:
   group: sesame-build
   cancel-in-progress: false
@@ -90,6 +92,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           git push origin "${{ env.TARGET_SOURCE_BRANCH }}" --force-with-lease
           echo "✅ dev 分支已同步并推送"
+
   sync-main:
     name: "🔄 同步上游 main 分支"
     runs-on: ubuntu-latest
@@ -132,6 +135,7 @@ jobs:
           git commit -m "Merge upstream/${{ env.UPSTREAM_MAIN_BRANCH }} [skip ci]" || true
           git push origin main --force-with-lease
           echo "✅ main 分支已同步并推送"
+
   build-and-release:
     name: "📦 Release Build"
     runs-on: ubuntu-latest
@@ -172,7 +176,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.pick-ref.outputs.checkout_ref }}
       - name: 设置时区
-        run: echo "TZ=Asia/Shanghai" >> "$GITHUB_ENV"
+        run: sudo timedatectl set-timezone Asia/Shanghai
       - name: 安装 JDK
         uses: actions/setup-java@v5
         with:
@@ -211,23 +215,24 @@ jobs:
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
-      # =========【重点：调用gradle task动态导出版本，适配gitCommitCount()函数版本】=========
-      - name: 读取Gradle动态版本号
+      - name: 读取动态版本号（源码正则提取）
         id: get_version
         run: |
-          ./gradlew :app:printVersion -q > version_out.txt
-          cat version_out.txt
-          VERSION_NAME=$(cat version_out.txt | grep "versionName=" | cut -d'=' -f2 | xargs)
-          VERSION_CODE=$(cat version_out.txt | grep "versionCode=" | cut -d'=' -f2 | xargs)
+          # 从 app/build.gradle.kts 中提取 versionName 和 versionCode
+          VERSION_NAME=$(grep -m1 -E 'versionName\s*=' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']?([^"'\'' ]+).*/\1/' | tr -d '\r')
+          VERSION_CODE=$(grep -m1 -E 'versionCode\s*=' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
+          
           if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
-            echo "❌ 无法从Gradle获取versionName / versionCode，停止构建"
+            echo "❌ 无法从 app/build.gradle.kts 中解析出版本号，请检查源码格式"
             exit 1
           fi
+          
           TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
           echo "versionName=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
           echo "versionCode=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "✅ 上游版本：${VERSION_CODE}-${VERSION_NAME}"
+          echo "✅ 解析成功 -> 版本: ${VERSION_NAME} (Code: ${VERSION_CODE})"
+
       - name: 执行 Release 构建
         run: ./gradlew --no-daemon --stacktrace assembleRelease
       - name: 准备待签名的 APK
@@ -323,7 +328,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
           releases="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/releases?per_page=100" | jq -r '.[] | select(.tag_name | test("^v[0-9]+-.*$")) | "\(.id) \(.tag_name)"' | sort -r)"
           count="$(printf '%s\n' "${releases}" | sed '/^$/d' | wc -l)"
           delete_count=$((count - 3))
