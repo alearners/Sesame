@@ -1,5 +1,4 @@
 name: Sesame-AG 第三方构建
-run-name: SesameAG | ${{ github.event_name }} | ${{ github.event_name == 'schedule' && (needs.sync-dev.outputs.dev_updated == 'true' && "上游已更新" || "无更新") || "手动触发构建" }}
 on:
   push:
     branches:
