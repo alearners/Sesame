@@ -9,7 +9,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 */3 * *'
-
 env:
   CI: "true"
   JAVA_DISTRIBUTION: "temurin"
@@ -25,7 +24,6 @@ env:
   UPSTREAM_BRANCH: "dev"
   UPSTREAM_MAIN_BRANCH: "main"
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
-
 concurrency:
   group: sesame-build
   cancel-in-progress: false
@@ -175,7 +173,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.pick-ref.outputs.checkout_ref }}
       - name: 设置时区
-        run: sudo timedatectl set-timezone Asia/Shanghai
+        run: echo "TZ=Asia/Shanghai" >> "$GITHUB_ENV"
       - name: 安装 JDK
         uses: actions/setup-java@v5
         with:
@@ -184,11 +182,6 @@ jobs:
           architecture: x64
       - name: 配置 Gradle Java Home
         run: echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
-      - name: 缓存Android SDK目录
-        uses: actions/cache@v4
-        with:
-          path: ~/.android
-          key: android-sdk-${{ env.ANDROID_PLATFORM }}-${{ env.ANDROID_BUILD_TOOLS }}
       - name: 安装 Android SDK 工具
         uses: android-actions/setup-android@v4
         with:
@@ -203,7 +196,6 @@ jobs:
           echo "::endgroup::"
       - name: 把build-tools加入PATH
         run: |
-          echo "ANDROID_BUILD_TOOLS_PATH=$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_PATH"
       - name: 配置 Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
@@ -214,53 +206,55 @@ jobs:
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
-      - name: 读取动态版本号（严格模式）
+      - name: 读取动态版本号（优先上游官方Tag，取不到直接终止）
         id: get_version
         run: |
           VERSION_NAME=""
           VERSION_CODE=""
 
-          # 1. 尝试从 gradle.properties 读取
-          VERSION_NAME=$(grep '^appVersion=' gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
-          
-          # 2. 尝试从 build.gradle.kts 严格匹配纯字符串（如 versionName = "0.2.6"）
-          # 如果遇到 project.property(...) 这种代码，正则将匹配失败，跳过本次赋值
-          if [ -z "$VERSION_NAME" ]; then
-            VERSION_NAME=$(grep -m1 -E 'versionName\s*=\s*["'\''][0-9a-zA-Z\._-]+["'\'']' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']([^"'\'']+)["'\''].*/\1/' | tr -d '\r')
+          # 第一层：从上游官方Tag解析，按 versionCode 数字降序取最新，确保准确
+          UPSTREAM_LATEST_TAG=$(git ls-remote --tags "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            | grep -E 'refs/tags/[0-9]+-' \
+            | grep -v '\^{}' \
+            | awk -F'refs/tags/' '{print $2}' \
+            | sort -t'-' -k1,1nr \
+            | head -n1)
+
+          if [[ "${UPSTREAM_LATEST_TAG}" =~ ^([0-9]+)-(.+)$ ]]; then
+            VERSION_CODE="${BASH_REMATCH[1]}"
+            VERSION_NAME="${BASH_REMATCH[2]}"
           fi
 
-          # 3. 尝试从 Git 历史 Tag 解析 (匹配类似 4380-0.2.6 格式)
-          if [ -z "$VERSION_NAME" ]; then
-            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
-            if [[ "$LATEST_TAG" =~ ^[0-9]+-(.+)$ ]]; then
-              VERSION_NAME="${BASH_REMATCH[1]}"
+          # 第二层：本地 build.gradle.kts 正则兜底
+          if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
+            if [ -f "app/build.gradle.kts" ]; then
+              [ -z "${VERSION_NAME}" ] && VERSION_NAME=$(grep -m1 -E 'versionName\s*=\s*["'\''][0-9a-zA-Z\._-]+["'\'']' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']([^"'\'']+)["'\''].*/\1/' | tr -d '\r')
+              [ -z "${VERSION_CODE}" ] && VERSION_CODE=$(grep -m1 -E 'versionCode\s*=\s*([0-9]+)' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
             fi
           fi
 
-          # 提取 VersionCode
-          VERSION_CODE=$(grep -m1 -E 'versionCode\s*=\s*([0-9]+)' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
-          if [ -z "$VERSION_CODE" ]; then
-            VERSION_CODE=$(git rev-list --count HEAD)
+          # 第三层：app/gradle.properties 兜底
+          if [ -z "${VERSION_NAME}" ]; then
+            VERSION_NAME=$(grep '^appVersion=' app/gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
           fi
 
-          # 4. 严格校验：如果提取不到版本名，或者提取到的版本名不是纯粹的字母/数字/点/连字符（说明抓到了代码文本），直接报错退出
-          if [ -z "$VERSION_NAME" ] || [[ ! "$VERSION_NAME" =~ ^[0-9a-zA-Z\._-]+$ ]]; then
-            echo "❌ 无法从源码或 Git 历史中解析出合法的 VersionName (当前提取到: '${VERSION_NAME}')，终止流程。"
+          # 严格校验
+          if [ -z "${VERSION_NAME}" ] || [[ ! "${VERSION_NAME}" =~ ^[0-9a-zA-Z\._-]+$ ]]; then
+            echo "❌ 无法解析出合法 VersionName（当前值：'${VERSION_NAME}'），终止构建"
+            exit 1
+          fi
+          if [ -z "${VERSION_CODE}" ] || [[ ! "${VERSION_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "❌ 无法解析出合法 VersionCode（当前值：'${VERSION_CODE}'），终止构建"
             exit 1
           fi
 
-          if [ -z "$VERSION_CODE" ] || [[ ! "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
-            echo "❌ 无法解析出合法的 VersionCode (当前提取到: '${VERSION_CODE}')，终止流程。"
-            exit 1
-          fi
-          
-          # 5. 组合格式化：Tag 必须安全，Display 采用你要求的格式
+          # 格式：版本名(版本号)，无V前缀
           TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
-          DISPLAY_VERSION="V${VERSION_NAME}(${VERSION_CODE})"
-          
+          DISPLAY_VERSION="${VERSION_NAME}(${VERSION_CODE})"
+
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "display_version=${DISPLAY_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "✅ 解析成功 -> 展示版本: ${DISPLAY_VERSION}，底层Tag: ${TAG_NAME}"
+          echo "✅ 解析成功 -> 展示版本：${DISPLAY_VERSION}，Tag：${TAG_NAME}"
 
       - name: 执行 Release 构建
         run: ./gradlew --no-daemon --stacktrace assembleRelease
@@ -302,7 +296,7 @@ jobs:
         id: upstream_info
         run: |
           git remote remove upstream 2>/dev/null || true
-          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream --quiet
           if git rev-parse --short upstream/dev >/dev/null 2>&1; then
             DEV_SHA="$(git rev-parse --short upstream/dev)"
@@ -348,6 +342,7 @@ jobs:
           name: Sesame-AG ${{ steps.get_version.outputs.display_version }}
           make_latest: true
           generate_release_notes: false
+          fail_on_unmatched_files: false
           body_path: release-body.md
           files: |
             ${{ env.ASSET_DIR }}/*.apk
@@ -357,7 +352,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
         run: |
-          releases="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/releases?per_page=100" | jq -r '.[] | select(.tag_name | test("^v[0-9]+-.*$")) | "\(.id) \(.tag_name)"' | sort -r)"
+          releases="$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${REPO}/releases?per_page=100" \
+            | jq -r '.[] | select(.tag_name | test("^v[0-9]+-.+$")) | "\(.id) \(.tag_name)"' \
+            | sort -r)"
           count="$(printf '%s\n' "${releases}" | sed '/^$/d' | wc -l)"
           delete_count=$((count - 3))
           if [ "${delete_count}" -le 0 ]; then exit 0; fi
