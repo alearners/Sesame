@@ -206,51 +206,45 @@ jobs:
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
-      - name: 读取动态版本号（优先上游官方Tag，取不到直接终止）
+      - name: 读取动态版本号（严格从上游Tag获取，失败即终止）
         id: get_version
         run: |
           VERSION_NAME=""
           VERSION_CODE=""
 
-          # 第一层：从上游官方Tag解析，按 versionCode 数字降序取最新，确保准确
-          UPSTREAM_LATEST_TAG=$(git ls-remote --tags "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
-            | grep -E 'refs/tags/[0-9]+-' \
+          # 核心：从上游官方Tag提取版本，100%对齐上游
+          UPSTREAM_TAGS=$(git ls-remote --tags "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
             | grep -v '\^{}' \
             | awk -F'refs/tags/' '{print $2}' \
-            | sort -t'-' -k1,1nr \
-            | head -n1)
+            | grep -E '^[0-9]+-[0-9]+\.[0-9]+\.[0-9]+$')
 
-          if [[ "${UPSTREAM_LATEST_TAG}" =~ ^([0-9]+)-(.+)$ ]]; then
-            VERSION_CODE="${BASH_REMATCH[1]}"
-            VERSION_NAME="${BASH_REMATCH[2]}"
-          fi
-
-          # 第二层：本地 build.gradle.kts 正则兜底
-          if [ -z "${VERSION_NAME}" ] || [ -z "${VERSION_CODE}" ]; then
-            if [ -f "app/build.gradle.kts" ]; then
-              [ -z "${VERSION_NAME}" ] && VERSION_NAME=$(grep -m1 -E 'versionName\s*=\s*["'\''][0-9a-zA-Z\._-]+["'\'']' app/build.gradle.kts | sed -E 's/.*versionName\s*=\s*["'\'']([^"'\'']+)["'\''].*/\1/' | tr -d '\r')
-              [ -z "${VERSION_CODE}" ] && VERSION_CODE=$(grep -m1 -E 'versionCode\s*=\s*([0-9]+)' app/build.gradle.kts | sed -E 's/.*versionCode\s*=\s*([0-9]+).*/\1/' | tr -d '\r')
+          if [ -n "${UPSTREAM_TAGS}" ]; then
+            # 按versionCode数字降序，取最新版本
+            UPSTREAM_LATEST_TAG=$(echo "${UPSTREAM_TAGS}" | sort -t'-' -k1,1nr | head -n1)
+            if [[ "${UPSTREAM_LATEST_TAG}" =~ ^([0-9]+)-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              VERSION_CODE="${BASH_REMATCH[1]}"
+              VERSION_NAME="${BASH_REMATCH[2]}"
             fi
           fi
 
-          # 第三层：app/gradle.properties 兜底
+          # 兜底：从 app/gradle.properties 读取
           if [ -z "${VERSION_NAME}" ]; then
             VERSION_NAME=$(grep '^appVersion=' app/gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
           fi
 
-          # 严格校验
-          if [ -z "${VERSION_NAME}" ] || [[ ! "${VERSION_NAME}" =~ ^[0-9a-zA-Z\._-]+$ ]]; then
-            echo "❌ 无法解析出合法 VersionName（当前值：'${VERSION_NAME}'），终止构建"
+          # 强校验：不符合格式直接终止，绝不产出错误版本
+          if [ -z "${VERSION_CODE}" ] || [[ ! "${VERSION_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "❌ 无法获取有效 versionCode（当前值：'${VERSION_CODE}'），终止构建"
             exit 1
           fi
-          if [ -z "${VERSION_CODE}" ] || [[ ! "${VERSION_CODE}" =~ ^[0-9]+$ ]]; then
-            echo "❌ 无法解析出合法 VersionCode（当前值：'${VERSION_CODE}'），终止构建"
+          if [ -z "${VERSION_NAME}" ] || [[ ! "${VERSION_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ 无法获取有效 versionName（当前值：'${VERSION_NAME}'），终止构建"
             exit 1
           fi
 
-          # 格式：版本名(版本号)，无V前缀
+          # 格式：展示 0.2.6 - 4380；Tag v4380-0.2.6
           TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
-          DISPLAY_VERSION="${VERSION_NAME}(${VERSION_CODE})"
+          DISPLAY_VERSION="${VERSION_NAME}-${VERSION_CODE}"
 
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "display_version=${DISPLAY_VERSION}" >> "$GITHUB_OUTPUT"
