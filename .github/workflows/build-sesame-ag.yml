@@ -411,12 +411,19 @@ jobs:
     timeout-minutes: 5
     needs: [ sync-dev, build-and-release ]
     permissions: {}
-    if: always() && needs.sync-dev.result == 'success'
+    if: always() && !cancelled()
     steps:
       - name: 准备邮件内容
         id: gen_email
         run: |
-          if [ "${{ needs.sync-dev.outputs.change_log }}" == "合并冲突" ]; then
+          if [ "${{ needs.sync-dev.result }}" != "success" ]; then
+            SUBJECT="❌ Sesame-AG 同步上游失败"
+            {
+              echo "❌ 从上游拉取代码失败，本次未进行编译构建。"
+              echo ""
+              echo "🔗 错误日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            } > email-body.txt
+          elif [ "${{ needs.sync-dev.outputs.change_log }}" == "合并冲突" ]; then
             SUBJECT="⚠️ Sesame-AG 上游合并冲突（警告）"
             {
               echo "⚠️ 上游dev分支合并冲突，本次不进行编译构建"
