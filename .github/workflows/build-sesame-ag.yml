@@ -227,9 +227,15 @@ jobs:
             fi
           fi
 
-          # 兜底：从 app/gradle.properties 读取
+          # 兜底：从仓库根目录 gradle.properties 读取（app/ 下不存在该文件）
           if [ -z "${VERSION_NAME}" ]; then
-            VERSION_NAME=$(grep '^appVersion=' app/gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
+            VERSION_NAME=$(grep '^appVersion=' gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
+          fi
+
+          # 交叉校验：源码里的 appVersion 与上游 Tag 的版本名应一致，不一致只警告不终止
+          SOURCE_VERSION=$(grep '^appVersion=' gradle.properties 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
+          if [ -n "${SOURCE_VERSION}" ] && [ "${SOURCE_VERSION}" != "${VERSION_NAME}" ]; then
+            echo "⚠️ 源码 appVersion=${SOURCE_VERSION} 与上游 Tag 版本名=${VERSION_NAME} 不一致，以 Tag 为准"
           fi
 
           # 强校验：不符合格式直接终止，绝不产出错误版本
@@ -242,9 +248,10 @@ jobs:
             exit 1
           fi
 
-          # 格式：展示 0.2.6 - 4380；Tag v4380-0.2.6
+          # 展示格式对齐主仓库：<versionCode>-<versionName>，例如 4380-0.2.6
+          # Tag 保留 v 前缀：主仓库 android.yml 只响应以数字开头的 tag，v 前缀可避免误触发
           TAG_NAME="v${VERSION_CODE}-${VERSION_NAME}"
-          DISPLAY_VERSION="${VERSION_NAME}-${VERSION_CODE}"
+          DISPLAY_VERSION="${VERSION_CODE}-${VERSION_NAME}"
 
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "display_version=${DISPLAY_VERSION}" >> "$GITHUB_OUTPUT"
@@ -271,6 +278,37 @@ jobs:
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
           buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
+      - name: 校验签名证书指纹
+        env:
+          EXPECTED_CERT_SHA256: "D961E2B2207699A4855416A5078091686279408328884D87039DB2ADB6BD9F80"
+          SIGNED_FILES: ${{ steps.sign_apks.outputs.signedFiles }}
+        run: |
+          set -euo pipefail
+          apksigner_bin="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          if [ ! -x "${apksigner_bin}" ]; then
+            echo "❌ 找不到 apksigner: ${apksigner_bin}"
+            exit 1
+          fi
+          IFS=':' read -r -a files <<< "${SIGNED_FILES}"
+          verified=0
+          for file in "${files[@]}"; do
+            [ -n "${file}" ] || continue
+            [ -f "${file}" ] || { echo "❌ 签名产物缺失：${file}"; exit 1; }
+            cert_out="$("${apksigner_bin}" verify --verbose --print-certs "${file}")" \
+              || { echo "❌ 验签失败：${file}"; exit 1; }
+            fp="$(printf '%s\n' "${cert_out}" \
+              | awk -F': ' '/certificate SHA-256 digest:/ {d=$NF; gsub(/:/,"",d); print toupper(d)}' \
+              | head -n1)"
+            if [ "${fp}" != "${EXPECTED_CERT_SHA256}" ]; then
+              echo "❌ 证书指纹不符：${file}"
+              echo "   期望：${EXPECTED_CERT_SHA256}"
+              echo "   实际：${fp}"
+              exit 1
+            fi
+            verified=$((verified + 1))
+          done
+          if [ "${verified}" -eq 0 ]; then echo "❌ 没有任何 APK 通过验签"; exit 1; fi
+          echo "✅ 已校验 ${verified} 个 APK，签名证书指纹与自签证书一致"
       - name: 规范化文件名
         run: |
           mkdir -p "${ASSET_DIR}"
@@ -282,7 +320,7 @@ jobs:
             for candidate in arm64-v8a armeabi-v7a x86_64 x86; do
               if [[ "${base}" == *"${candidate}"* ]]; then abi="${candidate}"; break; fi
             done
-            cp "${file}" "${ASSET_DIR}/app-${abi}-release-signed.apk"
+            cp "${file}" "${ASSET_DIR}/Sesame-AG-${{ steps.get_version.outputs.display_version }}-${abi}.apk"
           done
           cd "${ASSET_DIR}"
           sha256sum -- *.apk > SHA256SUMS
@@ -323,6 +361,10 @@ jobs:
               done
             fi
             echo ""
+            echo "## 🔐 签名信息"
+            echo "- 本包由 fork 仓库自行签名，**非上游官方签名**"
+            echo "- 证书 SHA-256：\`D961E2B2207699A4855416A5078091686279408328884D87039DB2ADB6BD9F80\`"
+            echo ""
             echo "## 📱 下载说明"
             echo "- \`universal\`: 通用版（推荐，适用所有设备）"
             echo "- \`arm64-v8a\`: 64位 ARM 设备（主流新手机）"
@@ -333,7 +375,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.tag_name }}
-          name: Sesame-AG ${{ steps.get_version.outputs.display_version }}
+          name: Release Build - ${{ steps.get_version.outputs.display_version }}
           make_latest: true
           generate_release_notes: false
           fail_on_unmatched_files: false
@@ -369,7 +411,7 @@ jobs:
     timeout-minutes: 5
     needs: [ sync-dev, build-and-release ]
     permissions: {}
-    if: always() && needs.build-and-release.result != 'skipped' && needs.build-and-release.result != 'cancelled'
+    if: always() && needs.sync-dev.result == 'success'
     steps:
       - name: 准备邮件内容
         id: gen_email
@@ -379,6 +421,15 @@ jobs:
             {
               echo "⚠️ 上游dev分支合并冲突，本次不进行编译构建"
               echo "🔗 日志地址：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            } > email-body.txt
+          elif [ "${{ needs.build-and-release.result }}" == "skipped" ]; then
+            SUBJECT="ℹ️ Sesame-AG 定时检查完成，上游无更新"
+            {
+              echo "ℹ️ 本次定时检查已完成：上游 dev 分支没有新提交，按设计跳过重复构建。"
+              echo ""
+              echo "这是预期行为，说明同步链路工作正常。"
+              echo ""
+              echo "🔗 运行日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             } > email-body.txt
           elif [ "${{ needs.build-and-release.result }}" == "success" ]; then
             SUBJECT="✅ Sesame-AG 构建成功 (${{ needs.build-and-release.outputs.version }})"
