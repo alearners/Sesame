@@ -105,6 +105,7 @@ fun FriendCenterScreen(
     var batchSelectedUserIds by rememberSaveable(userId) { mutableStateOf(setOf<String>()) }
     var groupPickerTargetUserIds by rememberSaveable(userId) { mutableStateOf(setOf<String>()) }
     var groupPickerTitle by rememberSaveable(userId) { mutableStateOf("") }
+    var confirmBlockAllInactive by rememberSaveable(userId) { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val visibleProfileIds = remember(state.profiles) {
@@ -190,6 +191,37 @@ fun FriendCenterScreen(
             },
             onToggle = { groupId, checked ->
                 viewModel.setMemberBatch(groupId, groupPickerTargetUserIds, checked)
+            }
+        )
+    }
+
+    if (confirmBlockAllInactive) {
+        AlertDialog(
+            onDismissRequest = { confirmBlockAllInactive = false },
+            title = { Text("一键屏蔽单向/失效好友") },
+            text = {
+                Text(
+                    "将把 ${unblockedInactiveProfiles.size} 个单向或已失效的好友加入全局黑名单，任务执行时不再尝试它们。\n\n" +
+                        "该操作只修改本地好友配置，不会解除支付宝好友关系，之后仍可在列表中逐个关闭。"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.setGlobalBlockedBatch(
+                            unblockedInactiveProfiles.map { it.userId },
+                            true
+                        )
+                        confirmBlockAllInactive = false
+                    }
+                ) {
+                    Text("屏蔽")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmBlockAllInactive = false }) {
+                    Text("取消")
+                }
             }
         )
     }
@@ -493,6 +525,27 @@ fun FriendCenterScreen(
             }
 
             if (showInactive) {
+                if (unblockedInactiveProfiles.isNotEmpty()) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "屏蔽后不再尝试偷取",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(
+                                onClick = { confirmBlockAllInactive = true }
+                            ) {
+                                Text("一键屏蔽全部（${unblockedInactiveProfiles.size}）")
+                            }
+                        }
+                    }
+                }
                 if (unblockedInactiveProfiles.isEmpty()) {
                     item {
                         Text("暂无单向或失效好友。", color = MaterialTheme.colorScheme.onSurfaceVariant)
