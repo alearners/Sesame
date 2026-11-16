@@ -84,7 +84,7 @@ jobs:
           CHANGE_LOG="$(git log --oneline "${BEFORE_SHA}..${AFTER_SHA}")"
           echo "dev_updated=true" >> "$GITHUB_OUTPUT"
           {
-            echo "change_log<<'CHANGE_LOG_EOF'"
+            echo "change_log<<CHANGE_LOG_EOF"
             echo "${CHANGE_LOG}"
             echo "CHANGE_LOG_EOF"
           } >> "$GITHUB_OUTPUT"
